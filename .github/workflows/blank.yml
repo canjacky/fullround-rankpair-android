@@ -1,36 +1,128 @@
-# This is a basic workflow to help you get started with Actions
+name: Build Android APK
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
-  push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
-
-  # Allows you to run this workflow manually from the Actions tab
   workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+permissions:
+  contents: read
+
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  build-apk:
+    name: Build debug APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+      # GitHub-owned actions only, pinned to full commit SHA.
+      # This is compatible with repositories that disallow third-party actions
+      # and with policies requiring actions to be pinned to a full SHA.
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+      - name: Set up Java 17
+        uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4
+        with:
+          distribution: temurin
+          java-version: '17'
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
+      - name: Verify / install Android SDK 35
+        shell: bash
         run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+          set -euo pipefail
+
+          if command -v sdkmanager >/dev/null 2>&1; then
+            SDKMANAGER="$(command -v sdkmanager)"
+          elif [ -x "${ANDROID_HOME:-}/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="${ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          elif [ -x "${ANDROID_SDK_ROOT:-}/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager"
+          else
+            echo "sdkmanager not found on GitHub runner" >&2
+            exit 1
+          fi
+
+          echo "Using sdkmanager: $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null 2>&1 || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Install pinned Gradle 8.10.2
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL --retry 3 \
+            https://services.gradle.org/distributions/gradle-8.10.2-bin.zip \
+            -o /tmp/gradle-8.10.2-bin.zip
+          unzip -q /tmp/gradle-8.10.2-bin.zip -d /opt
+          echo "/opt/gradle-8.10.2/bin" >> "$GITHUB_PATH"
+          /opt/gradle-8.10.2/bin/gradle --version
+
+      - name: Prepare compact Full-Round SQLite asset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p app/src/main/assets
+          unzip -o data/fullround_rankpair_app_v3.sqlite.zip -d app/src/main/assets
+          rm -f app/src/main/assets/FULLROUND_APP_DB_README.txt
+          ls -lh app/src/main/assets
+
+      - name: Validate SQLite asset
+        run: python3 tools/validate_app_db.py app/src/main/assets/fullround_rankpair_app_v3.sqlite
+
+      - name: Smoke-test canonical signature logic
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/smoke
+          javac -d build/smoke \
+            app/src/main/java/com/gesundheit/fullround/SignatureUtil.java \
+            tools/SignatureUtilSmokeTest.java
+          java -cp build/smoke SignatureUtilSmokeTest
+
+      - name: Smoke-test Full-Round CLI
+        run: python3 tools/test_fullround.py app/src/main/assets/fullround_rankpair_app_v3.sqlite
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle --no-daemon assembleDebug
+          ls -lh app/build/outputs/apk/debug/
+
+          APK_SOURCE="$(find app/build/outputs/apk/debug -maxdepth 1 -type f -name '*.apk' | head -n 1)"
+          if [ -z "$APK_SOURCE" ]; then
+            echo "No APK produced" >&2
+            exit 1
+          fi
+
+          mkdir -p dist
+          cp "$APK_SOURCE" dist/FullRound-RankPair-debug.apk
+          sha256sum dist/FullRound-RankPair-debug.apk | tee dist/FullRound-RankPair-debug.apk.sha256
+          ls -lh dist/
+
+      - name: Upload APK artifact
+        id: upload_apk
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fullround-rankpair-debug-apk
+          path: |
+            dist/FullRound-RankPair-debug.apk
+            dist/FullRound-RankPair-debug.apk.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Add download link to workflow summary
+        shell: bash
+        run: |
+          {
+            echo "## APK download"
+            echo
+            echo "Artifact: **fullround-rankpair-debug-apk**"
+            echo
+            echo "[Download APK artifact](${{ steps.upload_apk.outputs.artifact-url }})"
+            echo
+            echo "The downloaded GitHub artifact is a ZIP containing \`FullRound-RankPair-debug.apk\`."
+          } >> "$GITHUB_STEP_SUMMARY"
